@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO
 import qrcode
 import base64
@@ -8,6 +8,7 @@ import hashlib
 import time
 import uuid
 import json
+import os
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins='*')
@@ -132,36 +133,72 @@ def handle_qr_code(data):
     qr_data = data['data']
     print(f"[Debug] QR code received: {qr_data}")
     
-    # Store the last QR data globally for fresh requests
-    global last_qr_data
-    last_qr_data = qr_data
-    
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,  
-        box_size=10,
-        border=4,
-    )
+    # Check if we received a BankID token or a full BankID QR code
+    if '.' in qr_data and qr_data.startswith('bankid.'):
+        # Full BankID QR code format
+        parts = qr_data.split('.')
+        if len(parts) == 4:
+            # This is a valid BankID QR code
+            token = parts[1]  # Extract the token part
+            print(f"[Debug] Extracted BankID token from QR data: {token}")
+            
+            # Create a QR code with this data
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            
+            qr.add_data(qr_data)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white")
+            
+            buffered = BytesIO()
+            qr_img.save(buffered, format="PNG")
+            img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            
+            # Emit the QR data and token separately for backward compatibility
+            socketio.emit("update_qr_code_image", {
+                'qr_image': img_base64,
+                'qr_code_data': qr_data,
+                'autostarttoken': token
+            })
+            
+            # Also send the token for clients expecting it directly
+            socketio.emit("bankid_token", {'token': token})
+    else:
+        # Assume it's just a token or other QR data
+        # Store the QR data globally for fresh requests
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
 
-    qr.add_data(qr_data)
-    qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="black", back_color="white")
+        qr.add_data(qr_data)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white")
 
-    buffered = BytesIO()
-    qr_img.save(buffered, format="PNG")
-    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        buffered = BytesIO()
+        qr_img.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    # Also send the QR data to the client for deep linking
-    socketio.emit("update_qr_code_image", {
-        'qr_image': img_base64, 
-        'qr_code_data': qr_data,
-        'qrData': qr_data  # For backward compatibility
-    })
+        # Send the QR data to the client
+        socketio.emit("update_qr_code_image", {
+            'qr_image': img_base64, 
+            'qr_code_data': qr_data,
+            'autostarttoken': qr_data  # Use QR data as token
+        })
+        
+        # Also emit the bankid_token event for consistent handling
+        socketio.emit("bankid_token", {'token': qr_data})
 
 
 @socketio.on('request_qr_data')
 def handle_request_qr_data():
-    # This will generate a new BankID QR code
+    """Generate a new BankID QR code and emit it to the client"""
     session_id = str(uuid.uuid4())
     
     # Generate new QR data
@@ -205,29 +242,26 @@ def handle_request_qr_data():
     qr_img.save(buffered, format="PNG")
     img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
     
-    # Store the token as the last QR data for fresh requests
-    global last_qr_data
-    last_qr_data = qr_start_token
-    
-    # Send the QR image and token to the client
+    # Send the QR image, data, token, and session_id to the client
     socketio.emit("update_qr_code_image", {
         'qr_image': img_base64, 
         'qr_code_data': bankid_qr_data,
-        'qrData': qr_start_token  # Send just the token for deep linking
+        'autostarttoken': qr_start_token,
+        'session_id': session_id
     })
     
-    # Also send the token via qr_data event for compatibility
+    # Also send the token via qr_data event for backwards compatibility
     socketio.emit('qr_data', {'qrData': qr_start_token, 'session_id': session_id})
+    
+    # Return session data for session management
+    return {'session_id': session_id, 'token': qr_start_token}
 
 
 @socketio.on('request_fresh_qr_data')
 def handle_fresh_qr_data_request():
-    # Return the most recently scanned data or generate new data
-    if 'last_qr_data' in globals():
-        socketio.emit('qr_data', {'qrData': globals()['last_qr_data']})
-    else:
-        # Generate new QR data
-        handle_request_qr_data()
+    """Generate a fresh QR code and send it to the client"""
+    # Always generate new data for security
+    return handle_request_qr_data()
 
 
 # Clean up old session data periodically
@@ -248,6 +282,7 @@ def handle_connect():
 # Start animated QR code updates
 @socketio.on('start_qr_animation')
 def handle_start_qr_animation(data):
+    """Generate an updated QR code based on elapsed time"""
     session_id = data.get('session_id')
     if not session_id or session_id not in session_data:
         # Generate new session if not provided or invalid
@@ -289,10 +324,122 @@ def handle_start_qr_animation(data):
     socketio.emit("update_qr_code_image", {
         'qr_image': img_base64, 
         'qr_code_data': bankid_qr_data,
-        'qrData': qr_data['qr_start_token']  # Send just the token for deep linking
+        'autostarttoken': qr_data['qr_start_token'],
+        'session_id': session_id
+    })
+
+
+# API endpoint to handle mobile app deep linking
+@app.route('/api/bankid/start', methods=['POST'])
+def start_bankid():
+    """Start BankID authentication and return the autostart URL"""
+    # In a real implementation, this would call the BankID API 
+    # and include the returnUrl parameter in the API call
+    
+    data = request.json or {}
+    # Get current URL as return URL or use the provided one
+    return_url = data.get('returnUrl', request.referrer or request.url_root)
+    
+    # Create a nonce for session validation
+    nonce = str(uuid.uuid4()).replace('-', '')[:16]
+    
+    # Generate a session ID
+    session_id = str(uuid.uuid4())
+    
+    # Generate token and secret
+    qr_start_token = str(uuid.uuid4())
+    qr_start_secret = str(uuid.uuid4())
+    
+    # Store session data
+    session_data[session_id] = {
+        'qr_start_token': qr_start_token,
+        'qr_start_secret': qr_start_secret,
+        'order_time': time.time(),
+        'created_at': time.time(),
+        'return_url': return_url,
+        'nonce': nonce
+    }
+    
+    # Determine platform to provide appropriate URL
+    platform = data.get('platform', 'unknown')
+    
+    response_data = {
+        'session_id': session_id,
+        'autostart_token': qr_start_token,
+        'nonce': nonce
+    }
+    
+    # Add appropriate autostart URL based on platform
+    if platform == 'ios':
+        response_data['autostart_url'] = f"https://app.bankid.com/?autostarttoken={qr_start_token}&redirect=null"
+    elif platform == 'android':
+        response_data['autostart_url'] = f"https://app.bankid.com/?autostarttoken={qr_start_token}&redirect=null"
+    else:
+        # Desktop format
+        response_data['autostart_url'] = f"bankid:///?autostarttoken={qr_start_token}"
+    
+    return jsonify(response_data)
+
+
+@app.route('/api/bankid/qrcode/<session_id>')
+def get_qr_code_by_session(session_id):
+    """Get QR code image by session ID"""
+    if session_id not in session_data:
+        return jsonify({'error': 'Session not found'}), 404
+    
+    qr_data = session_data[session_id]
+    
+    # Generate the animated QR code based on time elapsed
+    qr_time = str(int(time.time() - qr_data['order_time']))
+    
+    # Compute qr_auth_code using HMAC-SHA256
+    qr_auth_code = hmac.new(
+        qr_data['qr_start_secret'].encode(), 
+        qr_time.encode(), 
+        hashlib.sha256
+    ).hexdigest()
+    
+    # Format the QR data according to BankID specs
+    bankid_qr_data = f"bankid.{qr_data['qr_start_token']}.{qr_time}.{qr_auth_code}"
+    
+    # Generate QR code image
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    
+    qr.add_data(bankid_qr_data)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white")
+    
+    buffered = BytesIO()
+    qr_img.save(buffered, format="PNG")
+    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+    
+    return jsonify({
+        'qr_image': img_base64,
+        'qr_data': bankid_qr_data,
+        'autostart_token': qr_data['qr_start_token']
+    })
+
+
+@app.route('/api/bankid/status/<session_id>')
+def check_bankid_status(session_id):
+    """Check the status of a BankID authentication session"""
+    # In a real implementation, this would call the BankID API to check status
+    if session_id not in session_data:
+        return jsonify({'status': 'error', 'message': 'Session not found'}), 404
+    
+    # For demo purposes, just return pending status
+    return jsonify({
+        'status': 'pending',
+        'message': 'Waiting for BankID authentication'
     })
 
 
 if __name__ == "__main__":
     # socketio.run(app, host='0.0.0.0', port=5000, debug=True)  
-    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+    port = int(os.environ.get('PORT', 5000))
+    socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
