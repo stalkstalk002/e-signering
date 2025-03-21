@@ -65,10 +65,64 @@ socket.on('update_qr_code_image', function (data) {
     qrContainer.style.alignItems = 'center';
     qrContainer.style.gap = '15px';
     
-    // Add QR image to container
+    // Add QR image to container with improved accessibility
     qrImage.style.display = 'block';
     qrImage.style.margin = '0 auto';
     qrImage.style.maxWidth = '200px';
+    qrImage.alt = 'BankID QR-kod. Klicka för att öppna i helskärm';
+    qrImage.role = 'button';
+    qrImage.tabIndex = '0';
+    qrImage.style.cursor = 'pointer';
+    
+    // Make QR code clickable for fullscreen view (for accessibility)
+    qrImage.addEventListener('click', function() {
+        // Create fullscreen modal for QR code
+        const fullscreenModal = document.createElement('div');
+        fullscreenModal.style.position = 'fixed';
+        fullscreenModal.style.top = '0';
+        fullscreenModal.style.left = '0';
+        fullscreenModal.style.width = '100%';
+        fullscreenModal.style.height = '100%';
+        fullscreenModal.style.backgroundColor = 'rgba(0,0,0,0.9)';
+        fullscreenModal.style.display = 'flex';
+        fullscreenModal.style.justifyContent = 'center';
+        fullscreenModal.style.alignItems = 'center';
+        fullscreenModal.style.zIndex = '1000';
+        
+        // Create larger QR image for fullscreen view
+        const fullscreenQR = document.createElement('img');
+        fullscreenQR.src = qrImage.src;
+        fullscreenQR.style.maxWidth = '80%';
+        fullscreenQR.style.maxHeight = '80%';
+        
+        // Close button
+        const closeButton = document.createElement('button');
+        closeButton.textContent = 'Stäng';
+        closeButton.style.position = 'absolute';
+        closeButton.style.top = '20px';
+        closeButton.style.right = '20px';
+        closeButton.style.padding = '10px 20px';
+        closeButton.style.backgroundColor = '#007aff';
+        closeButton.style.color = 'white';
+        closeButton.style.border = 'none';
+        closeButton.style.borderRadius = '4px';
+        closeButton.style.cursor = 'pointer';
+        
+        closeButton.addEventListener('click', function() {
+            document.body.removeChild(fullscreenModal);
+        });
+        
+        fullscreenModal.appendChild(fullscreenQR);
+        fullscreenModal.appendChild(closeButton);
+        document.body.appendChild(fullscreenModal);
+        
+        // Close on clicking outside the QR
+        fullscreenModal.addEventListener('click', function(e) {
+            if (e.target === fullscreenModal) {
+                document.body.removeChild(fullscreenModal);
+            }
+        });
+    });
     
     // Create continue button
     const continueButton = document.createElement('button');
@@ -100,11 +154,56 @@ socket.on('update_qr_code_image', function (data) {
     if (data.qrData) {
         bankIdQRData = data.qrData;
     }
+    
+    // Add countdown timer (accessibility improvement)
+    const timerContainer = document.createElement('div');
+    timerContainer.style.marginTop = '10px';
+    timerContainer.style.textAlign = 'center';
+    
+    const timerText = document.createElement('p');
+    timerText.textContent = 'QR-koden är giltig i: 30 sekunder';
+    timerText.style.margin = '5px 0';
+    
+    // Add button to extend session
+    const extendButton = document.createElement('button');
+    extendButton.textContent = 'Förläng session';
+    extendButton.style.padding = '8px 16px';
+    extendButton.style.backgroundColor = '#f1f1f1';
+    extendButton.style.border = 'none';
+    extendButton.style.borderRadius = '4px';
+    extendButton.style.cursor = 'pointer';
+    extendButton.style.marginTop = '5px';
+    
+    extendButton.addEventListener('click', function() {
+        // Request a new QR code from the server
+        socket.emit('request_qr_data');
+        timerText.textContent = 'QR-koden är giltig i: 30 sekunder';
+    });
+    
+    timerContainer.appendChild(timerText);
+    timerContainer.appendChild(extendButton);
+    modalContent.appendChild(timerContainer);
+    
+    // Start countdown timer
+    let timeLeft = 30;
+    const countdown = setInterval(function() {
+        timeLeft--;
+        timerText.textContent = `QR-koden är giltig i: ${timeLeft} sekunder`;
+        
+        if (timeLeft <= 0) {
+            clearInterval(countdown);
+            timerText.textContent = 'QR-koden har utgått. Vänligen förläng sessionen.';
+            timerText.style.color = 'red';
+        } else if (timeLeft <= 10) {
+            timerText.style.color = 'orange';
+        }
+    }, 1000);
 });
 
 function openBankIDApp() {
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
     const isAndroid = /Android/.test(navigator.userAgent);
+    const isMobile = isIOS || isAndroid;
     
     // Create dialog to confirm opening BankID app
     const confirmDialog = document.createElement('div');
@@ -138,27 +237,26 @@ function openBankIDApp() {
     });
     
     // Handle confirm button
-    // In the confirm button click handler, modify the token extraction
     document.getElementById('confirmOpenBankID').addEventListener('click', function() {
         document.body.removeChild(confirmDialog);
         
         // Get the most recent QR code data
-        // This approach avoids using potentially stale data
         socket.emit('request_fresh_qr_data');
         
         if (bankIdQRData) {
             console.log("Raw QR Data:", bankIdQRData);
             
-            // For BankID, use their recommended URL format
-            // Note: Different formats for different platforms
-            if (isIOS) {
-                // iOS specific format - simpler is often better for iOS
-                window.location.href = `bankid:///?autostarttoken=${bankIdQRData}`;
-            } else if (isAndroid) {
-                // Android may handle the full URL better
-                window.location.href = `bankid:///?autostarttoken=${bankIdQRData}`;
+            // Handle different URL formats based on platform and whether it's a mobile or desktop device
+            if (isMobile) {
+                if (isIOS) {
+                    // Use universal link for iOS
+                    window.location.href = `https://app.bankid.com/?autostarttoken=${bankIdQRData}&redirect=null`;
+                } else if (isAndroid) {
+                    // Use app link for Android
+                    window.location.href = `https://app.bankid.com/?autostarttoken=${bankIdQRData}&redirect=null`;
+                }
             } else {
-                // Desktop format
+                // Desktop format using bankid:// protocol
                 window.location.href = `bankid:///?autostarttoken=${bankIdQRData}`;
             }
             
@@ -178,10 +276,17 @@ function openBankIDApp() {
     });
 }
 
-// Update server.py to also send qrData along with the image
+// Request QR data from server on page load
 socket.emit('request_qr_data');
 socket.on('qr_data', function(data) {
     if (data && data.qrData) {
         bankIdQRData = data.qrData;
+    }
+});
+
+// Handle QR token from server if it uses the new format
+socket.on('bankid_token', function(data) {
+    if (data && data.token) {
+        bankIdQRData = data.token;
     }
 });
